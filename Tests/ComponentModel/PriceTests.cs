@@ -42,16 +42,16 @@ public class PriceTests : BaseTestClass
 	}
 
 	//[TestMethod]
-	//[ExpectedException(typeof(ArgumentException), "Единица измерения не может быть 'Step' так как не передана информация об инструменте.")]
+	//[ExpectedException(typeof(ArgumentException), "Единиц?измерения не може?быть 'Step' та?ка?не передана информац? об инструмент?")]
 	//public void InvalidParse()
 	//{
-	//    "10ш".ToPriceType(true);
+	//    "10?.ToPriceType(true);
 	//}
 
 	[TestMethod]
 	public void InvalidParse2()
 	{
-		ThrowsExactly<ArgumentOutOfRangeException>(() => "10н".ToPriceType());
+		ThrowsExactly<ArgumentOutOfRangeException>(() => "".ToPriceType());
 	}
 
 	[TestMethod]

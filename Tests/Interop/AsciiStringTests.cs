@@ -112,7 +112,7 @@ public class AsciiStringTests : BaseTestClass
 	[TestMethod]
 	public void WriteAndReadNonAsciiCharacters()
 	{
-		var value = "Hello©World"; // Contains non-ASCII character ©
+		var value = "Hello©World"; // Contains non-ASCII character ?		
 		var str16 = (AsciiString16)value;
 		unsafe
 		{
