@@ -1,5 +1,8 @@
 namespace Ecng.Data;
 
+using System.Data.Common;
+using System.Threading.Tasks;
+
 /// <summary>
 /// Interface for database-specific SQL dialect.
 /// Provides SQL syntax variations for different database providers.
@@ -126,4 +129,126 @@ public interface ISqlDialect
 	/// Gets the SQL suffix for an identity (auto-increment primary key) column definition.
 	/// </summary>
 	string GetIdentityColumnSuffix();
+
+	/// <summary>
+	/// Gets the full column definition (SQL type + NULL/NOT NULL).
+	/// </summary>
+	/// <param name="clrType">CLR type of the column.</param>
+	/// <param name="isNullable">Whether the column allows NULLs.</param>
+	/// <param name="maxLength">Max length for string columns (0 = MAX/unlimited).</param>
+	/// <param name="precision">Numeric precision (0 = use default).</param>
+	/// <param name="scale">Numeric scale (0 = use default).</param>
+	/// <returns>Column definition string (e.g. "NVARCHAR(128) NOT NULL").</returns>
+	string GetColumnDefinition(Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var typeName = GetSqlTypeName(clrType);
+		return $"{typeName} {(isNullable ? "NULL" : "NOT NULL")}";
+	}
+
+	/// <summary>
+	/// Appends ALTER TABLE ADD COLUMN statement.
+	/// </summary>
+	void AppendAddColumn(StringBuilder sb, string tableName, string columnName, string columnDef)
+	{
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} ADD {QuoteIdentifier(columnName)} {columnDef}");
+	}
+
+	/// <summary>
+	/// Appends ALTER TABLE ALTER COLUMN statement.
+	/// </summary>
+	/// <param name="sb">String builder.</param>
+	/// <param name="tableName">Table name (unquoted).</param>
+	/// <param name="columnName">Column name (unquoted).</param>
+	/// <param name="clrType">CLR type of the column.</param>
+	/// <param name="isNullable">Whether the column allows NULLs.</param>
+	/// <param name="maxLength">Max length for string/binary columns.</param>
+	/// <param name="precision">Numeric precision (0 = use default).</param>
+	/// <param name="scale">Numeric scale (0 = use default).</param>
+	void AppendAlterColumn(StringBuilder sb, string tableName, string columnName, Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var colDef = GetColumnDefinition(clrType, isNullable, maxLength, precision, scale);
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} ALTER COLUMN {QuoteIdentifier(columnName)} {colDef}");
+	}
+
+	/// <summary>
+	/// Appends ALTER TABLE DROP COLUMN statement.
+	/// </summary>
+	void AppendDropColumn(StringBuilder sb, string tableName, string columnName)
+	{
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} DROP COLUMN {QuoteIdentifier(columnName)}");
+	}
+
+	/// <summary>
+	/// Normalizes a raw database type name to the canonical form used by this dialect.
+	/// Used by schema comparison to match DB-reported types against <see cref="GetSqlTypeName"/> output.
+	/// </summary>
+	/// <param name="dbTypeName">Raw type name from database metadata.</param>
+	/// <returns>Normalized type name.</returns>
+	string NormalizeDbType(string dbTypeName) => dbTypeName.Trim().ToUpperInvariant();
+
+	/// <summary>
+	/// Appends a dialect-specific UPDATE ... SET ... WHERE statement.
+	/// </summary>
+	/// <param name="sb">String builder.</param>
+	/// <param name="tableName">Table name (unquoted).</param>
+	/// <param name="setColumns">Column names for the SET clause.</param>
+	/// <param name="whereColumns">Column names for the WHERE clause.</param>
+	void AppendUpdateBy(StringBuilder sb, string tableName, string[] setColumns, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate UPDATE for '{tableName}': no key columns specified for WHERE clause.");
+
+		sb.AppendLine($"update {QuoteIdentifier(tableName)}");
+		sb.AppendLine("set");
+
+		for (var i = 0; i < setColumns.Length; i++)
+		{
+			var comma = i < setColumns.Length - 1 ? "," : "";
+			sb.AppendLine($"\t{QuoteIdentifier(setColumns[i])} = {ParameterPrefix}{setColumns[i]}{comma}");
+		}
+
+		sb.AppendLine("where");
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
+	}
+
+	/// <summary>
+	/// Appends a dialect-specific DELETE ... WHERE statement.
+	/// </summary>
+	/// <param name="sb">String builder.</param>
+	/// <param name="tableName">Table name (unquoted).</param>
+	/// <param name="whereColumns">Column names for the WHERE clause.</param>
+	void AppendDeleteBy(StringBuilder sb, string tableName, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate DELETE for '{tableName}': no key columns specified for WHERE clause.");
+
+		sb.AppendLine("delete");
+		sb.Append($"from {QuoteIdentifier(tableName)}");
+		sb.AppendLine();
+		sb.AppendLine("where");
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
+	}
+
+	/// <summary>
+	/// Reads column metadata from a live database.
+	/// </summary>
+	/// <param name="connection">Open database connection.</param>
+	/// <param name="tableSchema">Schema filter (e.g. "dbo" for SQL Server, "public" for PostgreSQL). Null uses dialect default.</param>
+	/// <param name="cancellationToken">Cancellation token.</param>
+	/// <returns>List of column metadata from the database.</returns>
+	Task<IReadOnlyList<DbColumnInfo>> ReadDbSchemaAsync(
+		DbConnection connection,
+		string tableSchema = null,
+		CancellationToken cancellationToken = default)
+		=> throw new NotSupportedException();
 }

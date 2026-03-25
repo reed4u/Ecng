@@ -401,7 +401,6 @@ class Context
 			Parameters.AddRange(subParams.Select(p => ($"{p.Key}_{_subCount}", p.Value).ToPair()));
 		else
 		{
-			// TODO
 			foreach (var p in subParams)
 				Parameters[p.Key] = p.Value;
 		}
@@ -439,11 +438,12 @@ class Context
 		}
 	}
 
+	public int ParamCountOffset;
+
 	public string TryAddParam(string name, Type type, object value)
 	{
-		name += Parameters.Count;
+		name += Parameters.Count + ParamCountOffset;
 
-		//if (!Parameters.ContainsKey(name))
 		Parameters.Add(name, (type, value));
 
 		return name;

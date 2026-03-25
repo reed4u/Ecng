@@ -1,5 +1,7 @@
 namespace Ecng.Data.Sql;
 
+using Ecng.Common;
+
 /// <summary>
 /// Builds and caches SQL <see cref="Query"/> objects for standard CRUD operations.
 /// </summary>
@@ -16,7 +18,7 @@ public class QueryProvider
 		ArgumentNullException.ThrowIfNull(keyColumns);
 		ArgumentNullException.ThrowIfNull(valueColumns);
 
-		var cacheKey = (meta, type, string.Join(",", keyColumns.Select(c => c.Name)) + "|" + string.Join(",", valueColumns.Select(c => c.Name)));
+		var cacheKey = (meta, type, keyColumns.Select(c => c.Name).JoinComma() + "|" + valueColumns.Select(c => c.Name).JoinComma());
 
 		return _queries.SafeAdd(cacheKey, key =>
 		{
@@ -140,15 +142,10 @@ public class QueryProvider
 						.Where(c => c.IsReadOnly && !c.Name.EqualsIgnoreCase(meta.Identity?.Name))
 						.Select(c => c.Name).ToArray();
 
-					query = query
-									.Update(tableAlias)
-									.Set(tableAlias, nonReadOnlyNonIdentity)
-									.From()
-									.Table(meta.Name, tableAlias)
-									.NewLine()
-									.Where()
-									.NewLine()
-									.Equals(tableAlias, keyColumns.Select(c => c.Name).ToArray());
+					var keyNames = keyColumns.Select(c => c.Name).ToArray();
+
+					query = query.AddAction((dialect, sb) =>
+						dialect.AppendUpdateBy(sb, meta.Name, nonReadOnlyNonIdentity, keyNames));
 
 					if (readOnlyNonIdentity.Length > 0)
 					{
@@ -172,17 +169,12 @@ public class QueryProvider
 					return query;
 				}
 				case SqlCommandTypes.DeleteBy:
+				{
+					var delKeyNames = keyColumns.Select(c => c.Name).ToArray();
 
-					return query
-								.Delete()
-								.Raw(" " + tableAlias)
-								.NewLine()
-								.From()
-								.Table(meta.Name, tableAlias)
-								.NewLine()
-								.Where()
-								.NewLine()
-								.Equals(tableAlias, keyColumns.Select(c => c.Name).ToArray());
+					return query.AddAction((dialect, sb) =>
+						dialect.AppendDeleteBy(sb, meta.Name, delKeyNames));
+				}
 
 				case SqlCommandTypes.DeleteAll:
 

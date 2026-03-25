@@ -1,9 +1,12 @@
 namespace Ecng.Data;
 
 using System;
+using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Ecng.Common;
 
@@ -42,7 +45,7 @@ public class SqlServerDialect : SqlDialectBase
 	/// <inheritdoc />
 	public override string GetSqlTypeName(Type clrType)
 	{
-		var underlying = Nullable.GetUnderlyingType(clrType) ?? clrType;
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
 
 		return underlying switch
 		{
@@ -60,8 +63,31 @@ public class SqlServerDialect : SqlDialectBase
 			_ when underlying == typeof(TimeSpan) => "BIGINT", // stored as ticks
 			_ when underlying == typeof(Guid) => "UNIQUEIDENTIFIER",
 			_ when underlying == typeof(byte[]) => "VARBINARY(MAX)",
+			_ when underlying == typeof(DateOnly) => "DATE",
+			_ when underlying == typeof(TimeOnly) => "TIME",
 			_ => throw new NotSupportedException($"Type {clrType.Name} is not supported"),
 		};
+	}
+
+	/// <inheritdoc />
+	public override string GetColumnDefinition(Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
+
+		string typeName;
+
+		if (underlying == typeof(string))
+			typeName = maxLength > 0 ? $"NVARCHAR({maxLength})" : "NVARCHAR(MAX)";
+		else if (underlying == typeof(byte[]))
+			typeName = maxLength > 0 ? $"VARBINARY({maxLength})" : "VARBINARY(MAX)";
+		else if (underlying == typeof(decimal) && precision > 0)
+			typeName = $"DECIMAL({precision},{scale})";
+		else if ((underlying == typeof(DateTime) || underlying == typeof(DateTimeOffset)) && precision > 0)
+			typeName = $"{GetSqlTypeName(clrType)}({precision})";
+		else
+			typeName = GetSqlTypeName(clrType);
+
+		return $"{typeName} {(isNullable ? "NULL" : "NOT NULL")}";
 	}
 
 	/// <inheritdoc />
@@ -116,6 +142,122 @@ public class SqlServerDialect : SqlDialectBase
 
 		if (take.HasValue)
 			sb.Append($" FETCH NEXT {take.Value} ROWS ONLY");
+	}
+
+	/// <inheritdoc />
+	public override async Task<IReadOnlyList<DbColumnInfo>> ReadDbSchemaAsync(
+		DbConnection connection,
+		string tableSchema = null,
+		CancellationToken cancellationToken = default)
+	{
+		tableSchema ??= "dbo";
+
+		using var cmd = connection.CreateCommand();
+		cmd.CommandText = @"
+SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
+       COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsComputed') AS IsComputed
+FROM INFORMATION_SCHEMA.COLUMNS c
+WHERE c.TABLE_SCHEMA = @schema
+ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+
+		var param = cmd.CreateParameter();
+		param.ParameterName = "@schema";
+		param.Value = tableSchema;
+		cmd.Parameters.Add(param);
+
+		var result = new List<DbColumnInfo>();
+
+		using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+		while (await reader.ReadAsync(cancellationToken))
+		{
+			result.Add(new DbColumnInfo(
+				TableName: reader.GetString(0),
+				ColumnName: reader.GetString(1),
+				DataType: reader.GetString(2),
+				IsNullable: reader.GetString(3).EqualsIgnoreCase("YES"),
+				MaxLength: reader.IsDBNull(4) ? null : reader.GetInt32(4),
+				NumericPrecision: reader.IsDBNull(5) ? null : reader.GetValue(5).To<int?>(),
+				NumericScale: reader.IsDBNull(6) ? null : reader.GetValue(6).To<int?>(),
+				IsComputed: !reader.IsDBNull(7) && reader.GetValue(7).To<int>() == 1
+			));
+		}
+
+		return result;
+	}
+
+	/// <inheritdoc />
+	public override string NormalizeDbType(string dbTypeName)
+	{
+		return dbTypeName.Trim().ToUpperInvariant() switch
+		{
+			"NVARCHAR" or "VARCHAR" or "NCHAR" or "CHAR" or "NTEXT" or "TEXT" => "NVARCHAR",
+			"INT" or "INTEGER" => "INT",
+			"BIGINT" => "BIGINT",
+			"SMALLINT" => "SMALLINT",
+			"TINYINT" => "TINYINT",
+			"BIT" or "BOOLEAN" => "BIT",
+			"DECIMAL" or "NUMERIC" => "DECIMAL",
+			"FLOAT" or "DOUBLE PRECISION" => "FLOAT",
+			"REAL" => "REAL",
+			"DATE" => "DATE",
+			"TIME" => "TIME",
+			"DATETIME" or "DATETIME2" => "DATETIME2",
+			"DATETIMEOFFSET" => "DATETIMEOFFSET",
+			"UNIQUEIDENTIFIER" or "UUID" => "UNIQUEIDENTIFIER",
+			"VARBINARY" or "BINARY" or "IMAGE" or "BYTEA" => "VARBINARY",
+			var other => other,
+		};
+	}
+
+	/// <inheritdoc />
+	public override void AppendUpdateBy(StringBuilder sb, string tableName, string[] setColumns, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate UPDATE for '{tableName}': no key columns specified for WHERE clause.");
+
+		const string alias = "e";
+
+		sb.AppendLine($"update {QuoteIdentifier(alias)}");
+		sb.AppendLine("set");
+
+		for (var i = 0; i < setColumns.Length; i++)
+		{
+			var comma = i < setColumns.Length - 1 ? "," : "";
+			sb.AppendLine($"\t{alias}.{QuoteIdentifier(setColumns[i])} = {ParameterPrefix}{setColumns[i]}{comma}");
+		}
+
+		sb.AppendLine($"from {QuoteIdentifier(tableName)} {alias}");
+		sb.AppendLine("where");
+
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{alias}.{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
+	}
+
+	/// <inheritdoc />
+	public override void AppendDeleteBy(StringBuilder sb, string tableName, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate DELETE for '{tableName}': no key columns specified for WHERE clause.");
+
+		const string alias = "e";
+
+		sb.Append($"delete {alias}");
+		sb.AppendLine();
+		sb.Append($"from {QuoteIdentifier(tableName)} {alias}");
+		sb.AppendLine();
+		sb.AppendLine("where");
+
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{alias}.{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
 	}
 
 	/// <inheritdoc />

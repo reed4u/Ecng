@@ -4,6 +4,8 @@ using System.Text.RegularExpressions;
 
 using SmartFormat;
 using SmartFormat.Core.Extensions;
+using SmartFormat.Extensions;
+using SmartFormat.Utilities;
 
 /// <summary>
 /// Provides helper methods for string operations.
@@ -104,10 +106,40 @@ public static class StringHelper
 
 	static StringHelper()
 	{
-		Smart.Default.AddExtensions(new DictionarySourceEx());
+		Smart.Default.AddDictionarySourceEx();
+
+		// register Uzbek and Kyrgyz plural rules (not yet in SmartFormat.NET upstream)
+		PluralRules.IsoLangToDelegate.TryAdd("uz", PluralRules.GetPluralRule("kk"));
+		PluralRules.IsoLangToDelegate.TryAdd("ky", PluralRules.GetPluralRule("kk"));
 
 		// https://stackoverflow.com/a/47017180
 		Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+	}
+
+	/// <summary>
+	/// Adds <see cref="DictionarySourceEx"/> to the formatter.
+	/// Handles <see cref="IDictionary"/> with any key type (enum, int, etc.)
+	/// and returns null for missing keys instead of throwing.
+	/// </summary>
+	public static SmartFormatter AddDictionarySourceEx(this SmartFormatter formatter)
+	{
+		if (formatter is null)
+			throw new ArgumentNullException(nameof(formatter));
+
+		formatter.AddExtensions(new DictionarySourceEx());
+		return formatter;
+	}
+
+	/// <summary>
+	/// Creates a pre-configured <see cref="SmartFormatter"/> with
+	/// <see cref="DictionarySourceEx"/> and <c>DefaultFormatter.Name = "default"</c>.
+	/// </summary>
+	public static SmartFormatter CreateSmartFormatterEx()
+	{
+		var formatter = Smart.CreateDefaultSmartFormat();
+		formatter.AddDictionarySourceEx();
+		formatter.GetFormatterExtension<DefaultFormatter>()!.Name = "default";
+		return formatter;
 	}
 
 	/// <summary>
@@ -189,22 +221,6 @@ public static class StringHelper
 			throw new ArgumentNullException(nameof(args));
 
 		return args.Length == 0 ? str : Smart.Format(str, args);
-	}
-
-	/// <summary>
-	/// Asynchronously formats the string using Smart.Format with the provided arguments.
-	/// </summary>
-	/// <param name="str">The format string.</param>
-	/// <param name="args">The arguments to format the string with.</param>
-	/// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
-	/// <returns>A ValueTask containing the formatted string.</returns>
-	/// <exception cref="ArgumentNullException">Thrown when args is null.</exception>
-	public static ValueTask<string> PutExAsync(this string str, object[] args, CancellationToken cancellationToken)
-	{
-		if (args is null)
-			throw new ArgumentNullException(nameof(args));
-
-		return args.Length == 0 ? new(str) : Smart.FormatAsync(str, args, cancellationToken);
 	}
 
 	private static Type GetGenericType(this Type targetType, Type genericType)

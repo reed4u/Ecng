@@ -740,6 +740,62 @@ class StringIsNullOrWhiteSpaceVisitor : MethodVisitor<string>
 	}
 }
 
+class StringHelperIsEmptyVisitor : MethodVisitor
+{
+	public StringHelperIsEmptyVisitor()
+		: base(typeof(StringHelper).GetMember(nameof(StringHelper.IsEmpty))
+			.OfType<MethodInfo>()
+			.Where(m => m.GetParameters().Length == 1))
+	{
+	}
+
+	public override void Visit(ExpressionQueryTranslator translator, Expression expression)
+	{
+		var q = translator.Context.Curr;
+
+		q.OpenBracket();
+
+		var mce = (MethodCallExpression)expression;
+
+		translator.Visit(mce.Arguments[0]);
+		q.Is().Null();
+
+		q.Or();
+		translator.Visit(mce.Arguments[0]);
+		q.Like().Raw("N''");
+
+		q.CloseBracket();
+	}
+}
+
+class StringHelperIsEmptyOrWhiteSpaceVisitor : MethodVisitor
+{
+	public StringHelperIsEmptyOrWhiteSpaceVisitor()
+		: base(typeof(StringHelper).GetMember(nameof(StringHelper.IsEmptyOrWhiteSpace))
+			.OfType<MethodInfo>()
+			.Where(m => m.GetParameters().Length == 1))
+	{
+	}
+
+	public override void Visit(ExpressionQueryTranslator translator, Expression expression)
+	{
+		var q = translator.Context.Curr;
+
+		q.OpenBracket();
+
+		var mce = (MethodCallExpression)expression;
+
+		translator.Visit(mce.Arguments[0]);
+		q.Is().Null();
+
+		q.Or();
+		translator.Visit(mce.Arguments[0]);
+		q.Equal().Raw("N''");
+
+		q.CloseBracket();
+	}
+}
+
 class StringIndexOfVisitor : MethodVisitor<string>
 {
 	public StringIndexOfVisitor()
@@ -1587,7 +1643,7 @@ class ContainsVisitor<T> : MethodVisitor
 		var isSubQuery = firstArg.NodeType == ExpressionType.Call;
 
 		if (isSubQuery)
-			translator.Context = new() { Curr = new() };
+			translator.Context = new() { Curr = new(), ParamCountOffset = ctx.Parameters.Count + ctx.ParamCountOffset };
 
 		translator.Visit(firstArg);
 
@@ -1633,7 +1689,7 @@ class ConcatVisitor<T> : EnumerableAndQueryableVisitor<T>
 
 		foreach (var arg in mce.Arguments)
 		{
-			translator.Context = new();
+			translator.Context = new() { ParamCountOffset = ctx.Parameters.Count + ctx.ParamCountOffset };
 			translator.Visit(arg);
 
 			translator.Context.Build(schema).CopyTo(ctx.Curr);
@@ -1668,7 +1724,7 @@ class UnionVisitor<T> : EnumerableAndQueryableVisitor<T>
 
 		foreach (var arg in mce.Arguments)
 		{
-			translator.Context = new();
+			translator.Context = new() { ParamCountOffset = ctx.Parameters.Count + ctx.ParamCountOffset };
 			translator.Visit(arg);
 
 			translator.Context.Build(schema).CopyTo(ctx.Curr);

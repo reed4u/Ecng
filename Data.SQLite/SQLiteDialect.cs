@@ -1,9 +1,12 @@
 namespace Ecng.Data;
 
 using System;
+using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Ecng.Common;
 
@@ -42,7 +45,7 @@ public class SQLiteDialect : SqlDialectBase
 	/// <inheritdoc />
 	public override string GetSqlTypeName(Type clrType)
 	{
-		var underlying = Nullable.GetUnderlyingType(clrType) ?? clrType;
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
 
 		// SQLite has dynamic typing, but we use affinity types
 		return underlying switch
@@ -61,6 +64,8 @@ public class SQLiteDialect : SqlDialectBase
 			_ when underlying == typeof(TimeSpan) => "INTEGER", // stored as ticks
 			_ when underlying == typeof(Guid) => "TEXT",
 			_ when underlying == typeof(byte[]) => "BLOB",
+			_ when underlying == typeof(DateOnly) => "TEXT", // ISO8601 date format
+			_ when underlying == typeof(TimeOnly) => "TEXT", // ISO8601 time format
 			_ => throw new NotSupportedException($"Type {clrType.Name} is not supported"),
 		};
 	}
@@ -117,6 +122,68 @@ public class SQLiteDialect : SqlDialectBase
 
 		if (skip.HasValue)
 			sb.Append($" OFFSET {skip.Value}");
+	}
+
+	/// <inheritdoc />
+	public override async Task<IReadOnlyList<DbColumnInfo>> ReadDbSchemaAsync(
+		DbConnection connection,
+		string tableSchema = null,
+		CancellationToken cancellationToken = default)
+	{
+		var result = new List<DbColumnInfo>();
+
+		// get all table names
+		var tables = new List<string>();
+
+		using (var cmd = connection.CreateCommand())
+		{
+			cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
+
+			using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+			while (await reader.ReadAsync(cancellationToken))
+				tables.Add(reader.GetString(0));
+		}
+
+		// read columns per table via pragma
+		foreach (var table in tables)
+		{
+			using var cmd = connection.CreateCommand();
+			cmd.CommandText = $"PRAGMA table_xinfo({QuoteIdentifier(table)})";
+
+			using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+			while (await reader.ReadAsync(cancellationToken))
+			{
+				// table_xinfo columns: cid, name, type, notnull, dflt_value, pk, hidden
+				var hidden = reader.GetInt32(6);
+				result.Add(new DbColumnInfo(
+					TableName: table,
+					ColumnName: reader.GetString(1),
+					DataType: reader.GetString(2),
+					IsNullable: reader.GetInt32(3) == 0,
+					MaxLength: null,
+					NumericPrecision: null,
+					NumericScale: null,
+					IsComputed: hidden is 2 or 3
+				));
+			}
+		}
+
+		return result;
+	}
+
+	/// <inheritdoc />
+	public override string NormalizeDbType(string dbTypeName)
+	{
+		return dbTypeName.Trim().ToUpperInvariant() switch
+		{
+			"INTEGER" or "INT" or "BIGINT" or "SMALLINT" or "TINYINT" => "INTEGER",
+			"REAL" or "FLOAT" or "DOUBLE" or "DOUBLE PRECISION" or "NUMERIC" or "DECIMAL" => "REAL",
+			"TEXT" or "VARCHAR" or "NVARCHAR" or "CHAR" or "NCHAR" or "CLOB" => "TEXT",
+			"BLOB" or "VARBINARY" or "BINARY" or "BYTEA" => "BLOB",
+			var other => other,
+		};
 	}
 
 	/// <inheritdoc />

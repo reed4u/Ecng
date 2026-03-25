@@ -1,9 +1,12 @@
 namespace Ecng.Data;
 
 using System;
+using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Ecng.Common;
 
@@ -42,7 +45,7 @@ public class PostgreSqlDialect : SqlDialectBase
 	/// <inheritdoc />
 	public override string GetSqlTypeName(Type clrType)
 	{
-		var underlying = Nullable.GetUnderlyingType(clrType) ?? clrType;
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
 
 		return underlying switch
 		{
@@ -60,6 +63,8 @@ public class PostgreSqlDialect : SqlDialectBase
 			_ when underlying == typeof(TimeSpan) => "BIGINT", // stored as ticks
 			_ when underlying == typeof(Guid) => "UUID",
 			_ when underlying == typeof(byte[]) => "BYTEA",
+			_ when underlying == typeof(DateOnly) => "DATE",
+			_ when underlying == typeof(TimeOnly) => "TIME",
 			_ => throw new NotSupportedException($"Type {clrType.Name} is not supported"),
 		};
 	}
@@ -114,6 +119,117 @@ public class PostgreSqlDialect : SqlDialectBase
 
 		if (skip.HasValue)
 			sb.Append($" OFFSET {skip.Value}");
+	}
+
+	/// <inheritdoc />
+	public override string GetColumnDefinition(Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
+
+		string typeName;
+
+		if (underlying == typeof(string))
+			typeName = maxLength > 0 ? $"VARCHAR({maxLength})" : "TEXT";
+		else if (underlying == typeof(byte[]))
+			typeName = "BYTEA";
+		else if (underlying == typeof(decimal) && precision > 0)
+			typeName = $"NUMERIC({precision},{scale})";
+		else if ((underlying == typeof(DateTime) || underlying == typeof(DateTimeOffset)) && precision > 0)
+			typeName = $"{GetSqlTypeName(clrType)}({precision})";
+		else
+			typeName = GetSqlTypeName(clrType);
+
+		return $"{typeName} {(isNullable ? "NULL" : "NOT NULL")}";
+	}
+
+	/// <inheritdoc />
+	public override async Task<IReadOnlyList<DbColumnInfo>> ReadDbSchemaAsync(
+		DbConnection connection,
+		string tableSchema = null,
+		CancellationToken cancellationToken = default)
+	{
+		tableSchema ??= "public";
+
+		using var cmd = connection.CreateCommand();
+		cmd.CommandText = @"
+SELECT table_name, column_name, data_type, is_nullable, character_maximum_length, numeric_precision, numeric_scale,
+       is_generated <> 'NEVER' AS is_computed
+FROM information_schema.columns
+WHERE table_schema = @schema
+ORDER BY table_name, ordinal_position";
+
+		var param = cmd.CreateParameter();
+		param.ParameterName = "@schema";
+		param.Value = tableSchema;
+		cmd.Parameters.Add(param);
+
+		var result = new List<DbColumnInfo>();
+
+		using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+		while (await reader.ReadAsync(cancellationToken))
+		{
+			result.Add(new DbColumnInfo(
+				TableName: reader.GetString(0),
+				ColumnName: reader.GetString(1),
+				DataType: reader.GetString(2),
+				IsNullable: reader.GetString(3).EqualsIgnoreCase("YES"),
+				MaxLength: reader.IsDBNull(4) ? null : reader.GetInt32(4),
+				NumericPrecision: reader.IsDBNull(5) ? null : reader.GetValue(5).To<int?>(),
+				NumericScale: reader.IsDBNull(6) ? null : reader.GetValue(6).To<int?>(),
+				IsComputed: !reader.IsDBNull(7) && reader.GetBoolean(7)
+			));
+		}
+
+		return result;
+	}
+
+	/// <inheritdoc />
+	public override void AppendAlterColumn(StringBuilder sb, string tableName, string columnName, Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var underlying = clrType.GetUnderlyingType() ?? clrType;
+
+		string typeName;
+
+		if (underlying == typeof(string))
+			typeName = maxLength > 0 ? $"VARCHAR({maxLength})" : "TEXT";
+		else if (underlying == typeof(byte[]))
+			typeName = "BYTEA";
+		else if (underlying == typeof(decimal) && precision > 0)
+			typeName = $"NUMERIC({precision},{scale})";
+		else
+			typeName = GetSqlTypeName(clrType);
+
+		var qt = QuoteIdentifier(tableName);
+		var qc = QuoteIdentifier(columnName);
+
+		// PostgreSQL requires separate statements for type and nullability changes
+		sb.Append($"ALTER TABLE {qt} ALTER COLUMN {qc} SET DATA TYPE {typeName}; ");
+		sb.Append($"ALTER TABLE {qt} ALTER COLUMN {qc} {(isNullable ? "DROP NOT NULL" : "SET NOT NULL")}");
+	}
+
+	/// <inheritdoc />
+	public override string NormalizeDbType(string dbTypeName)
+	{
+		return dbTypeName.Trim().ToUpperInvariant() switch
+		{
+			"CHARACTER VARYING" or "VARCHAR" => "TEXT",
+			"TEXT" => "TEXT",
+			"INTEGER" or "INT" => "INTEGER",
+			"BIGINT" => "BIGINT",
+			"SMALLINT" => "SMALLINT",
+			"BOOLEAN" or "BIT" => "BOOLEAN",
+			"NUMERIC" or "DECIMAL" => "NUMERIC",
+			"DOUBLE PRECISION" or "FLOAT" => "DOUBLE PRECISION",
+			"REAL" => "REAL",
+			"DATE" => "DATE",
+			"TIME" or "TIME WITHOUT TIME ZONE" => "TIME",
+			"TIMESTAMP" or "TIMESTAMP WITHOUT TIME ZONE" => "TIMESTAMP",
+			"TIMESTAMPTZ" or "TIMESTAMP WITH TIME ZONE" => "TIMESTAMPTZ",
+			"UUID" or "UNIQUEIDENTIFIER" => "UUID",
+			"BYTEA" or "VARBINARY" => "BYTEA",
+			var other => other,
+		};
 	}
 
 	/// <inheritdoc />

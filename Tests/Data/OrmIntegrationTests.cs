@@ -78,13 +78,13 @@ public class OrmIntegrationTests : BaseTestClass
 		using var conn = new SqlConnection(_connectionString);
 		conn.Open();
 
-		Execute(conn, "DELETE FROM [TestItemCategory]");
-		Execute(conn, "DELETE FROM [TestItem]");
-		Execute(conn, "DELETE FROM [TestCategory]");
-		Execute(conn, "DELETE FROM [TestTask]");
-		Execute(conn, "DELETE FROM [TestPerson]");
-		Execute(conn, "DELETE FROM [TestNodeChild]");
-		Execute(conn, "DELETE FROM [TestNode]");
+		Execute(conn, "DELETE FROM [Ecng_TestItemCategory]");
+		Execute(conn, "DELETE FROM [Ecng_TestItem]");
+		Execute(conn, "DELETE FROM [Ecng_TestCategory]");
+		Execute(conn, "DELETE FROM [Ecng_TestTask]");
+		Execute(conn, "DELETE FROM [Ecng_TestPerson]");
+		Execute(conn, "DELETE FROM [Ecng_TestNodeChild]");
+		Execute(conn, "DELETE FROM [Ecng_TestNode]");
 
 		Storage.ClearCacheAsync(CancellationToken).AsTask().Wait();
 	}
@@ -888,6 +888,36 @@ public class OrmIntegrationTests : BaseTestClass
 
 		var results = await Query<TestItem>()
 			.Where(x => !string.IsNullOrEmpty(x.Name))
+			.ToArrayAsyncEx(CancellationToken);
+
+		results.Length.AssertEqual(1);
+		results[0].Name.AssertEqual("NonEmpty");
+	}
+
+	[TestMethod]
+	public async Task String_IsEmpty()
+	{
+		EnsureDb();
+		await InsertItem("NonEmpty");
+		await InsertItem("");
+
+		var results = await Query<TestItem>()
+			.Where(x => !x.Name.IsEmpty())
+			.ToArrayAsyncEx(CancellationToken);
+
+		results.Length.AssertEqual(1);
+		results[0].Name.AssertEqual("NonEmpty");
+	}
+
+	[TestMethod]
+	public async Task String_IsEmptyOrWhiteSpace()
+	{
+		EnsureDb();
+		await InsertItem("NonEmpty");
+		await InsertItem("");
+
+		var results = await Query<TestItem>()
+			.Where(x => !x.Name.IsEmptyOrWhiteSpace())
 			.ToArrayAsyncEx(CancellationToken);
 
 		results.Length.AssertEqual(1);
@@ -1800,9 +1830,9 @@ public class OrmIntegrationTests : BaseTestClass
 		using (var conn = new SqlConnection(_connectionString))
 		{
 			conn.Open();
-			Execute(conn, "SET IDENTITY_INSERT [TestPerson] ON");
-			Execute(conn, "INSERT INTO [TestPerson] (Id, Name) VALUES (0, 'ZeroRoot')");
-			Execute(conn, "SET IDENTITY_INSERT [TestPerson] OFF");
+			Execute(conn, "SET IDENTITY_INSERT [Ecng_TestPerson] ON");
+			Execute(conn, "INSERT INTO [Ecng_TestPerson] (Id, Name) VALUES (0, 'ZeroRoot')");
+			Execute(conn, "SET IDENTITY_INSERT [Ecng_TestPerson] OFF");
 		}
 
 		// Insert a task referencing Person Id=0
@@ -1815,6 +1845,315 @@ public class OrmIntegrationTests : BaseTestClass
 		loaded.AssertNotNull();
 		loaded.Person.AssertNotNull("FK with id=0 must not be null");
 		loaded.Person.Name.AssertEqual("ZeroRoot");
+	}
+
+	#endregion
+
+	#region Finding #3: BulkLoad count cap
+
+	[TestMethod]
+	public async Task BulkLoad_GetCount_ReturnsActualCount_NotCappedByMaxBulkLoadRows()
+	{
+		// Finding #3: When MaxBulkLoadRows is smaller than the actual row count,
+		// GetCountAsync returns cache size instead of real DB count.
+		EnsureDb();
+
+		// Set small cap to reproduce without 100K rows
+		_db.MaxBulkLoadRows = 3;
+
+		try
+		{
+			// Insert more rows than the cap
+			for (var i = 0; i < 7; i++)
+				await InsertItem($"BulkItem{i}");
+
+			// Enable bulk load
+			Storage.AddBulkLoad<TestItem>();
+
+			// GetCountAsync should return 7 (actual DB count), not 3 (cache cap)
+			var count = await Storage.GetCountAsync<TestItem>(CancellationToken);
+			count.AssertEqual(7);
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	[TestMethod]
+	public async Task BulkLoad_GetById_FallsBackToDb_WhenNotInCache()
+	{
+		// ReadAsync returns null for ids beyond bulk cache cap instead of querying DB.
+		EnsureDb();
+
+		_db.MaxBulkLoadRows = 3;
+
+		try
+		{
+			// Insert 7 rows — bulk cache will hold only 3 (lowest ids)
+			var items = new List<TestItem>();
+			for (var i = 0; i < 7; i++)
+				items.Add(await InsertItem($"BulkById{i}"));
+
+			Storage.AddBulkLoad<TestItem>();
+
+			// Trigger bulk cache init
+			await Storage.GetCountAsync<TestItem>(CancellationToken);
+
+			// Last item has highest id — NOT in bulk cache
+			var lastItem = items[^1];
+			var loaded = await Storage.GetByIdAsync<long, TestItem>(lastItem.Id, CancellationToken);
+
+			loaded.AssertNotNull($"GetById should fall back to DB when id {lastItem.Id} is not in bulk cache");
+			loaded.Name.AssertEqual(lastItem.Name);
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	[TestMethod]
+	public async Task BulkLoad_GetById_CachesDbMiss_ReturnsNullFast()
+	{
+		// After DB confirms id doesn't exist, subsequent calls should return null
+		// without hitting DB again.
+		EnsureDb();
+
+		_db.MaxBulkLoadRows = 3;
+
+		try
+		{
+			await InsertItem("OnlyOne");
+			Storage.AddBulkLoad<TestItem>();
+
+			// Non-existent id — should return null
+			var missing = await Storage.GetByIdAsync<long, TestItem>(999999, CancellationToken);
+			missing.AssertNull("Non-existent id should return null");
+
+			// Second call — should also return null (cached miss)
+			var missing2 = await Storage.GetByIdAsync<long, TestItem>(999999, CancellationToken);
+			missing2.AssertNull("Repeated call for non-existent id should still return null");
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	[TestMethod]
+	public async Task BulkLoad_LinqWhere_QueriesFullDb_NotTruncatedCache()
+	{
+		// LINQ queries over bulk-loaded entities execute against truncated in-memory set
+		// instead of querying the full database.
+		EnsureDb();
+
+		_db.MaxBulkLoadRows = 3;
+
+		try
+		{
+			for (var i = 0; i < 7; i++)
+				await InsertItem($"LinqItem{i}", priority: i + 1);
+
+			Storage.AddBulkLoad<TestItem>();
+
+			// LINQ Where — should find all 7, not just the 3 in cache
+			var results = await Query<TestItem>()
+				.Where(x => x.Priority > 0)
+				.ToArrayAsyncEx(CancellationToken);
+
+			results.Length.AssertEqual(7,
+				$"LINQ query should return all 7 rows from DB, not {results.Length} from truncated cache");
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	#endregion
+
+	#region GetByIdsAsync
+
+	[TestMethod]
+	public async Task GetByIdsAsync_ReturnsAllMatchingEntities()
+	{
+		EnsureDb();
+
+		var item1 = await InsertItem("Alpha", priority: 1);
+		var item2 = await InsertItem("Beta", priority: 2);
+		var item3 = await InsertItem("Gamma", priority: 3);
+
+		await ClearCache();
+
+		var result = await Storage.GetByIdsAsync<long, TestItem>([item1.Id, item2.Id, item3.Id], CancellationToken);
+
+		result.Length.AssertEqual(3);
+		result.Select(r => r.Name).OrderBy(n => n).ToArray()
+			.AssertEqual(new[] { "Alpha", "Beta", "Gamma" });
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_EmptyIds_ReturnsEmpty()
+	{
+		EnsureDb();
+
+		var result = await Storage.GetByIdsAsync<long, TestItem>([], CancellationToken);
+
+		result.Length.AssertEqual(0);
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_NonExistentIds_ReturnsOnlyFound()
+	{
+		EnsureDb();
+
+		var item = await InsertItem("Existing");
+
+		await ClearCache();
+
+		var result = await Storage.GetByIdsAsync<long, TestItem>([item.Id, 999999, 888888], CancellationToken);
+
+		result.Length.AssertEqual(1);
+		result[0].Name.AssertEqual("Existing");
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_UsesBulkCache_WhenAvailable()
+	{
+		EnsureDb();
+
+		_db.MaxBulkLoadRows = 100;
+
+		try
+		{
+			var item1 = await InsertItem("Cached1", priority: 1);
+			var item2 = await InsertItem("Cached2", priority: 2);
+
+			Storage.AddBulkLoad<TestItem>();
+
+			// first call populates bulk cache, second should hit it
+			var result1 = await Storage.GetByIdsAsync<long, TestItem>([item1.Id, item2.Id], CancellationToken);
+			result1.Length.AssertEqual(2);
+
+			var result2 = await Storage.GetByIdsAsync<long, TestItem>([item1.Id, item2.Id], CancellationToken);
+			result2.Length.AssertEqual(2);
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_CachesMisses_InBulkDict()
+	{
+		EnsureDb();
+
+		_db.MaxBulkLoadRows = 3;
+
+		try
+		{
+			await InsertItem("Only");
+
+			Storage.AddBulkLoad<TestItem>();
+
+			// query with non-existent ids — should cache the miss
+			var result = await Storage.GetByIdsAsync<long, TestItem>([999999, 888888], CancellationToken);
+			result.Length.AssertEqual(0);
+
+			// second call should return immediately from cached misses
+			var result2 = await Storage.GetByIdsAsync<long, TestItem>([999999, 888888], CancellationToken);
+			result2.Length.AssertEqual(0);
+		}
+		finally
+		{
+			_db.ClearBulkLoad();
+			_db.MaxBulkLoadRows = 100000;
+		}
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_SingleQuery_InClause()
+	{
+		EnsureDb();
+
+		var items = new List<TestItem>();
+		for (var i = 0; i < 10; i++)
+			items.Add(await InsertItem($"Item{i}", priority: i));
+
+		await ClearCache();
+
+		// request 5 of them in one call
+		var requestIds = items.Where((_, idx) => idx % 2 == 0).Select(i => i.Id).ToArray();
+
+		var result = await Storage.GetByIdsAsync<long, TestItem>(requestIds, CancellationToken);
+
+		result.Length.AssertEqual(5);
+		result.Select(r => r.Name).OrderBy(n => n).ToArray()
+			.AssertEqual(new[] { "Item0", "Item2", "Item4", "Item6", "Item8" });
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_PreservesInputOrder()
+	{
+		EnsureDb();
+
+		var item1 = await InsertItem("First", priority: 1);
+		var item2 = await InsertItem("Second", priority: 2);
+		var item3 = await InsertItem("Third", priority: 3);
+
+		await ClearCache();
+
+		// request in reverse order
+		var result = await Storage.GetByIdsAsync<long, TestItem>([item3.Id, item1.Id, item2.Id], CancellationToken);
+
+		result.Length.AssertEqual(3);
+		result[0].Name.AssertEqual("Third");
+		result[1].Name.AssertEqual("First");
+		result[2].Name.AssertEqual("Second");
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_DuplicateIds_ReturnsDuplicateEntries()
+	{
+		EnsureDb();
+
+		var item = await InsertItem("OnlyOne");
+
+		await ClearCache();
+
+		var result = await Storage.GetByIdsAsync<long, TestItem>([item.Id, item.Id, item.Id], CancellationToken);
+
+		result.Length.AssertEqual(3);
+		result[0].Name.AssertEqual("OnlyOne");
+		result[1].Name.AssertEqual("OnlyOne");
+		result[2].Name.AssertEqual("OnlyOne");
+	}
+
+	[TestMethod]
+	public async Task GetByIdsAsync_DuplicateIds_MixedWithNonExistent()
+	{
+		EnsureDb();
+
+		var item1 = await InsertItem("A");
+		var item2 = await InsertItem("B");
+
+		await ClearCache();
+
+		// duplicates + non-existent
+		var result = await Storage.GetByIdsAsync<long, TestItem>([item2.Id, 999999, item1.Id, item2.Id, 888888], CancellationToken);
+
+		// non-existent skipped, duplicates preserved in order
+		result.Length.AssertEqual(3);
+		result[0].Name.AssertEqual("B");
+		result[1].Name.AssertEqual("A");
+		result[2].Name.AssertEqual("B");
 	}
 
 	#endregion

@@ -39,7 +39,7 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 	private static IQueryable<T> CreateQueryable<T>()
 		=> new DefaultQueryable<T>(new DefaultQueryProvider<T>(new DummyQueryContext()), null);
 
-	private static string GenerateSql<TSource>(IQueryable queryable)
+	private static (string sql, IDictionary<string, (Type, object)> parameters) TranslateSql<TSource>(IQueryable queryable)
 	{
 		var expression = queryable.Expression;
 		var meta = SchemaRegistry.Get(typeof(TSource));
@@ -49,9 +49,13 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 		var translatorType = asm.GetType("Ecng.Data.Sql.ExpressionQueryTranslator");
 		var translator = Activator.CreateInstance(translatorType, [meta]);
 		var query = (Query)translatorType.GetMethod("GenerateSql").Invoke(translator, [expression]);
+		var parameters = (IDictionary<string, (Type, object)>)translatorType.GetProperty("Parameters").GetValue(translator);
 
-		return query.Render(_dialect);
+		return (query.Render(_dialect), parameters);
 	}
+
+	private static string GenerateSql<TSource>(IQueryable queryable)
+		=> TranslateSql<TSource>(queryable).sql;
 
 	[TestMethod]
 	public void SubqueryAny_ShouldNotProduceEmptyAlias()
@@ -109,6 +113,32 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 		sql.Contains("[]").AssertFalse($"SQL should not contain empty alias '[]', got: {sql}");
 	}
 
+	[TestMethod]
+	public void StringHelper_IsEmpty_TranslatesToSql()
+	{
+		var items = CreateQueryable<TestItem>();
+
+		var query = items.Where(x => !x.Name.IsEmpty());
+
+		var sql = GenerateSql<TestItem>(query);
+
+		sql.ContainsIgnoreCase("is null").AssertTrue($"Expected 'is null' in SQL, got: {sql}");
+		sql.Contains("like N''").AssertTrue($"Expected 'like N''' in SQL, got: {sql}");
+	}
+
+	[TestMethod]
+	public void StringHelper_IsEmptyOrWhiteSpace_TranslatesToSql()
+	{
+		var items = CreateQueryable<TestItem>();
+
+		var query = items.Where(x => !x.Name.IsEmptyOrWhiteSpace());
+
+		var sql = GenerateSql<TestItem>(query);
+
+		sql.ContainsIgnoreCase("is null").AssertTrue($"Expected 'is null' in SQL, got: {sql}");
+		sql.Contains("= N''").AssertTrue($"Expected '= N''' in SQL, got: {sql}");
+	}
+
 	/// <summary>
 	/// When C# compiler folds "select new VEntity { Prop = joined.Col }" into the
 	/// last Join's result selector (inner join without "into"), the translator must
@@ -135,8 +165,8 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 
 		sql.Contains("JoinedCategoryName").AssertTrue(
 			$"SQL must include computed column 'JoinedCategoryName' from Join result selector, got: {sql}");
-		sql.Contains("[TestCategory]").AssertTrue(
-			$"SQL must include INNER JOIN to TestCategory, got: {sql}");
+		sql.Contains("[Ecng_TestCategory]").AssertTrue(
+			$"SQL must include INNER JOIN to Ecng_TestCategory, got: {sql}");
 	}
 
 	/// <summary>
@@ -166,8 +196,8 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 
 		sql.Contains("LeftJoinedDescription").AssertTrue(
 			$"SQL must include computed column 'LeftJoinedDescription' from SelectMany result selector, got: {sql}");
-		sql.Contains("[TestCategory]").AssertTrue(
-			$"SQL must include LEFT JOIN to TestCategory, got: {sql}");
+		sql.Contains("[Ecng_TestCategory]").AssertTrue(
+			$"SQL must include LEFT JOIN to Ecng_TestCategory, got: {sql}");
 	}
 
 	/// <summary>
@@ -196,11 +226,76 @@ public class ExpressionQueryTranslatorTests : BaseTestClass
 
 		sql.Contains("JoinedCategoryName").AssertTrue(
 			$"SQL must include 'JoinedCategoryName' from multi-join MemberInit, got: {sql}");
-		sql.Contains("[TestCategory]").AssertTrue(
-			$"SQL must include JOIN to TestCategory, got: {sql}");
-		sql.Contains("[TestPerson]").AssertTrue(
-			$"SQL must include JOIN to TestPerson, got: {sql}");
+		sql.Contains("[Ecng_TestCategory]").AssertTrue(
+			$"SQL must include JOIN to Ecng_TestCategory, got: {sql}");
+		sql.Contains("[Ecng_TestPerson]").AssertTrue(
+			$"SQL must include JOIN to Ecng_TestPerson, got: {sql}");
 	}
+	// Helper that produces same closure field name "value" for both calls
+	private static IQueryable<TestItem> FilterByName(IQueryable<TestItem> q, string value)
+		=> q.Where(x => x.Name == value);
+
+	// Helper that produces same closure field name "value" for subquery tests
+	private static IQueryable<TestTask> FilterTasksByName(IQueryable<TestTask> q, string value)
+		=> q.Where(x => x.Title == value);
+
+	[TestMethod]
+	public void Concat_DifferentConstants_ParametersPreserved()
+	{
+		var items = CreateQueryable<TestItem>();
+
+		// Same closure field name "value" → same parameter base name → collision without fix
+		var left = FilterByName(items, "AAA");
+		var right = FilterByName(items, "BBB");
+		var query = left.Concat(right);
+
+		var (sql, parameters) = TranslateSql<TestItem>(query);
+
+		var values = parameters.Values.Select(v => v.Item2).ToArray();
+		values.AssertContains("AAA");
+		values.AssertContains("BBB");
+	}
+
+	[TestMethod]
+	public void Union_DifferentConstants_ParametersPreserved()
+	{
+		var items = CreateQueryable<TestItem>();
+
+		var left = FilterByName(items, "XXX");
+		var right = FilterByName(items, "YYY");
+		var query = left.Union(right);
+
+		var (sql, parameters) = TranslateSql<TestItem>(query);
+
+		var values = parameters.Values.Select(v => v.Item2).ToArray();
+		values.AssertContains("XXX");
+		values.AssertContains("YYY");
+	}
+
+	[TestMethod]
+	public void MultipleSubqueries_SameClosureFieldName_ParametersPreserved()
+	{
+		var persons = CreateQueryable<TestPerson>();
+		var tasks = CreateQueryable<TestTask>();
+
+		var left = FilterTasksByName(tasks, "AAA");
+		var right = FilterTasksByName(tasks, "BBB");
+
+		var query = from p in persons
+					select new VTestPersonWithTasks
+					{
+						AllColumns = p.AllColumns,
+						HasTasks = (from t in left where t.Person.Id == p.Id select t).Any(),
+						TaskCount = (from t in right where t.Person.Id == p.Id select t).Count(),
+					};
+
+		var (_, parameters) = TranslateSql<TestPerson>(query);
+
+		var values = parameters.Values.Select(v => v.Item2).ToArray();
+		values.AssertContains("AAA");
+		values.AssertContains("BBB");
+	}
+
 }
 
 public class VTestPersonWithTasks : IDbPersistable

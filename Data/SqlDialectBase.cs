@@ -1,5 +1,8 @@
 namespace Ecng.Data;
 
+using System.Data.Common;
+using System.Threading.Tasks;
+
 /// <summary>
 /// Base class for SQL dialect implementations.
 /// </summary>
@@ -81,4 +84,82 @@ public abstract class SqlDialectBase : ISqlDialect
 
 	/// <inheritdoc />
 	public virtual string NewId() => throw new NotSupportedException();
+
+	/// <inheritdoc />
+	public virtual string GetColumnDefinition(Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var typeName = GetSqlTypeName(clrType);
+		return $"{typeName} {(isNullable ? "NULL" : "NOT NULL")}";
+	}
+
+	/// <inheritdoc />
+	public virtual void AppendAddColumn(StringBuilder sb, string tableName, string columnName, string columnDef)
+	{
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} ADD {QuoteIdentifier(columnName)} {columnDef}");
+	}
+
+	/// <inheritdoc />
+	public virtual void AppendAlterColumn(StringBuilder sb, string tableName, string columnName, Type clrType, bool isNullable, int maxLength = 0, int precision = 0, int scale = 0)
+	{
+		var colDef = GetColumnDefinition(clrType, isNullable, maxLength, precision, scale);
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} ALTER COLUMN {QuoteIdentifier(columnName)} {colDef}");
+	}
+
+	/// <inheritdoc />
+	public virtual void AppendDropColumn(StringBuilder sb, string tableName, string columnName)
+	{
+		sb.Append($"ALTER TABLE {QuoteIdentifier(tableName)} DROP COLUMN {QuoteIdentifier(columnName)}");
+	}
+
+	/// <inheritdoc />
+	public virtual string NormalizeDbType(string dbTypeName) => dbTypeName.Trim().ToUpperInvariant();
+
+	/// <inheritdoc />
+	public virtual void AppendUpdateBy(StringBuilder sb, string tableName, string[] setColumns, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate UPDATE for '{tableName}': no key columns specified for WHERE clause.");
+
+		sb.AppendLine($"update {QuoteIdentifier(tableName)}");
+		sb.AppendLine("set");
+
+		for (var i = 0; i < setColumns.Length; i++)
+		{
+			var comma = i < setColumns.Length - 1 ? "," : "";
+			sb.AppendLine($"\t{QuoteIdentifier(setColumns[i])} = {ParameterPrefix}{setColumns[i]}{comma}");
+		}
+
+		sb.AppendLine("where");
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
+	}
+
+	/// <inheritdoc />
+	public virtual void AppendDeleteBy(StringBuilder sb, string tableName, string[] whereColumns)
+	{
+		if (whereColumns.Length == 0)
+			throw new InvalidOperationException($"Cannot generate DELETE for '{tableName}': no key columns specified for WHERE clause.");
+
+		sb.AppendLine("delete");
+		sb.Append($"from {QuoteIdentifier(tableName)}");
+		sb.AppendLine();
+		sb.AppendLine("where");
+		for (var i = 0; i < whereColumns.Length; i++)
+		{
+			if (i > 0)
+				sb.Append(" and ");
+			sb.Append($"{QuoteIdentifier(whereColumns[i])} = {ParameterPrefix}{whereColumns[i]}");
+		}
+	}
+
+	/// <inheritdoc />
+	public virtual Task<IReadOnlyList<DbColumnInfo>> ReadDbSchemaAsync(
+		DbConnection connection,
+		string tableSchema = null,
+		CancellationToken cancellationToken = default)
+		=> throw new NotSupportedException();
 }

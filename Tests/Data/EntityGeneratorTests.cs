@@ -12,7 +12,7 @@ public class EntityGeneratorTests : BaseTestClass
 	{
 		var schema = SchemaRegistry.Get(typeof(GenTestOrderEntity));
 
-		schema.TableName.AssertEqual("Orders");
+		schema.TableName.AssertEqual("Ecng_Orders");
 	}
 
 	[TestMethod]
@@ -51,6 +51,283 @@ public class EntityGeneratorTests : BaseTestClass
 		colNames.AssertContains("Symbol");
 		colNames.AssertContains("Price");
 	}
+
+	[TestMethod]
+	public void EntitySchema_ViaInterface()
+	{
+		IDbPersistable entity = new GenTestOrderEntity();
+		var schema = entity.Schema;
+
+		schema.AssertNotNull();
+		schema.TableName.AssertEqual("Ecng_Orders");
+		schema.AssertSame(SchemaRegistry.Get(typeof(GenTestOrderEntity)));
+	}
+
+	[TestMethod]
+	public void EntitySchema_ViaInterface_Plain()
+	{
+		IDbPersistable entity = new GenTestPlainEntity();
+		var schema = entity.Schema;
+
+		schema.AssertNotNull();
+		schema.TableName.AssertEqual("GenTestPlainEntity");
+	}
+
+	#region ColumnAttribute in generated schema
+
+	[TestMethod]
+	public void Generated_ColumnAttr_MaxLength()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "Name");
+
+		col.MaxLength.AssertEqual(128);
+	}
+
+	[TestMethod]
+	public void Generated_ColumnAttr_IsNullable()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "Description");
+
+		col.IsNullable.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_ColumnAttr_Both()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "Tag");
+
+		col.IsNullable.AssertTrue();
+		col.MaxLength.AssertEqual(64);
+	}
+
+	[TestMethod]
+	public void Generated_NoAttr_String_NotNullable()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "Plain");
+
+		col.IsNullable.AssertFalse();
+		col.MaxLength.AssertEqual(0);
+	}
+
+	[TestMethod]
+	public void Generated_NullableValueType_IsNullable()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "NullableInt");
+
+		col.IsNullable.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_ValueType_NotNullable()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnAttrEntity));
+		var col = schema.Columns.First(c => c.Name == "RequiredInt");
+
+		col.IsNullable.AssertFalse();
+	}
+
+	#endregion
+
+	#region Enum properties
+
+	[TestMethod]
+	public void Generated_Enum_ClrTypeIsUnderlyingInt()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestEnumEntity));
+		var col = schema.Columns.First(c => c.Name == "Status");
+
+		col.ClrType.AssertEqual(typeof(int));
+		col.IsNullable.AssertFalse();
+	}
+
+	[TestMethod]
+	public void Generated_NullableEnum_ClrTypeIsUnderlyingInt()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestEnumEntity));
+		var col = schema.Columns.First(c => c.Name == "NullableStatus");
+
+		col.ClrType.AssertEqual(typeof(int));
+		col.IsNullable.AssertTrue();
+	}
+
+	#endregion
+
+	#region Identity type
+
+	[TestMethod]
+	public void Generated_Identity_IntType()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestIntIdEntity));
+
+		schema.Identity.AssertNotNull();
+		schema.Identity.Name.AssertEqual("Id");
+		schema.Identity.ClrType.AssertEqual(typeof(int));
+	}
+
+	[TestMethod]
+	public void Generated_Identity_GuidType()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestGuidIdEntity));
+
+		schema.Identity.AssertNotNull();
+		schema.Identity.Name.AssertEqual("Id");
+		schema.Identity.ClrType.AssertEqual(typeof(Guid));
+	}
+
+	[TestMethod]
+	public void Generated_RelationSingle_GuidRef_ClrTypeIsGuid()
+	{
+		// Long-identity entity referencing a Guid-identity entity
+		var schema = SchemaRegistry.Get(typeof(GenTestLongRefGuidEntity));
+		var col = schema.Columns.First(c => c.Name == "GuidRef");
+
+		col.ClrType.AssertEqual(typeof(Guid));
+	}
+
+	[TestMethod]
+	public void Generated_RelationSingle_LongRef_ClrTypeIsLong()
+	{
+		// Guid-identity entity referencing a long-identity entity
+		var schema = SchemaRegistry.Get(typeof(GenTestGuidIdEntity));
+		var col = schema.Columns.First(c => c.Name == "Order");
+
+		col.ClrType.AssertEqual(typeof(long));
+	}
+
+	#endregion
+
+	#region Nullable inner schema propagation
+
+	[TestMethod]
+	public void Generated_NullableInnerSchema_ColumnsAreNullable()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestNullableInnerEntity));
+
+		var street = schema.Columns.First(c => c.Name == "AddressStreet");
+		var city = schema.Columns.First(c => c.Name == "AddressCity");
+
+		street.IsNullable.AssertTrue();
+		city.IsNullable.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_NullMid_NullBranchPropagates4Levels()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestNullMidEntity));
+
+		// L2.Top — outer is NOT NULL → NOT NULL
+		schema.Columns.First(c => c.Name == "DataTop").IsNullable.AssertFalse();
+
+		// NullBranch subtree — [Column(IsNullable = true)] at L2.NullBranch → all NULL
+		schema.Columns.First(c => c.Name == "DataNullBranchMid").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataNullBranchL4Deep").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataNullBranchL4Count").IsNullable.AssertTrue();
+
+		// SolidBranch subtree — no nullable marker → all NOT NULL
+		schema.Columns.First(c => c.Name == "DataSolidBranchMid").IsNullable.AssertFalse();
+		schema.Columns.First(c => c.Name == "DataSolidBranchL4Deep").IsNullable.AssertFalse();
+		schema.Columns.First(c => c.Name == "DataSolidBranchL4Count").IsNullable.AssertFalse();
+	}
+
+	[TestMethod]
+	public void Generated_NullCantCancel_OuterWins()
+	{
+		// Outer [Column(IsNullable = true)] + inner [Column(IsNullable = false)]
+		// Outer wins — column must be nullable because container can be null.
+		var schema = SchemaRegistry.Get(typeof(GenTestNullCantCancelEntity));
+
+		schema.Columns.First(c => c.Name == "DataForced").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataNormal").IsNullable.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_NullRoot_Entire4LevelTreeNullable()
+	{
+		// Root is nullable → everything is nullable, including SolidBranch
+		var schema = SchemaRegistry.Get(typeof(GenTestNullRootEntity));
+
+		schema.Columns.First(c => c.Name == "DataTop").IsNullable.AssertTrue();
+
+		schema.Columns.First(c => c.Name == "DataNullBranchMid").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataNullBranchL4Deep").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataNullBranchL4Count").IsNullable.AssertTrue();
+
+		schema.Columns.First(c => c.Name == "DataSolidBranchMid").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataSolidBranchL4Deep").IsNullable.AssertTrue();
+		schema.Columns.First(c => c.Name == "DataSolidBranchL4Count").IsNullable.AssertTrue();
+	}
+
+	#endregion
+
+	#region [ColumnOverride] — generated schema
+
+	[TestMethod]
+	public void Generated_ColumnOverride_OverridesInnerNullability()
+	{
+		// Outer [Column(IsNullable = true)] makes all inner nullable,
+		// but [ColumnOverride("Secret", IsNullable = false)] overrides Secret to NOT NULL.
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnOverrideEntity));
+
+		// Auth.Key — outer nullable, no override → NULL
+		schema.Columns.First(c => c.Name == "AuthKey").IsNullable.AssertTrue();
+
+		// Auth.Secret — [ColumnOverride] forces NOT NULL
+		schema.Columns.First(c => c.Name == "AuthSecret").IsNullable.AssertFalse();
+	}
+
+	[TestMethod]
+	public void Generated_ColumnOverride_WithNameOverride()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestColumnOverrideWithNameEntity));
+
+		// Auth.Key — outer nullable, no override → NULL
+		schema.Columns.First(c => c.Name == "AuthKey").IsNullable.AssertTrue();
+
+		// Auth.Secret → renamed to "ApiToken" via NameOverride, forced NOT NULL via ColumnOverride
+		schema.Columns.Any(c => c.Name == "AuthSecret").AssertFalse(
+			"Secret should be renamed to ApiToken");
+
+		var apiToken = schema.Columns.First(c => c.Name == "ApiToken");
+		apiToken.IsNullable.AssertFalse();
+	}
+
+	#endregion
+
+	#region Finding #1: Identity IsUnique/IsIndex
+
+	[TestMethod]
+	public void Generated_Identity_HasIsUnique()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestOrderEntity));
+
+		schema.Identity.AssertNotNull();
+		schema.Identity.IsUnique.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_Identity_HasIsIndex()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestOrderEntity));
+
+		schema.Identity.AssertNotNull();
+		schema.Identity.IsIndex.AssertTrue();
+	}
+
+	[TestMethod]
+	public void Generated_Identity_AppearsInUniqueColumns()
+	{
+		var schema = SchemaRegistry.Get(typeof(GenTestOrderEntity));
+
+		schema.UniqueColumns.Any(c => c.Name == schema.Identity.Name).AssertTrue(
+			"Identity must appear in UniqueColumns for cache invalidation to work");
+	}
+
+	#endregion
 }
 
 #endif

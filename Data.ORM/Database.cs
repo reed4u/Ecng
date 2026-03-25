@@ -23,8 +23,6 @@ public class Database : Disposable, IStorage
 		private readonly Database _database;
 		private CachedSynchronizedDictionary<object, object> _cachedEntities;
 
-		private const int _maxBulk = 100000;
-
 		public BulkLoadInfo(Database database, Schema meta)
 		{
 			_database = database ?? throw new ArgumentNullException(nameof(database));
@@ -43,7 +41,7 @@ public class Database : Disposable, IStorage
 				object[] cachedEntities;
 
 				using (new Scope<BulkLoadInfo>(this))
-					cachedEntities = await _database.ReadAllAsync(Meta, 0, _maxBulk, default, Meta.Identity.Name, ListSortDirection.Ascending, cancellationToken);
+					cachedEntities = await _database.ReadAllAsync(Meta, 0, _database.MaxBulkLoadRows, default, Meta.Identity.Name, ListSortDirection.Ascending, cancellationToken);
 
 				var dict = new CachedSynchronizedDictionary<object, object>();
 
@@ -284,7 +282,17 @@ public class Database : Disposable, IStorage
 	/// </summary>
 	public bool AllowDeleteAll { get; set; }
 
+	/// <summary>
+	/// Gets or sets the maximum number of rows to preload in bulk-load mode.
+	/// </summary>
+	public int MaxBulkLoadRows { get; set; } = 100000;
+
 	void IStorage.AddBulkLoad<TEntity>() => _bulkLoad.Add(typeof(TEntity), new(this, SchemaRegistry.Get(typeof(TEntity))));
+
+	/// <summary>
+	/// Removes all bulk-load registrations and their cached data.
+	/// </summary>
+	public void ClearBulkLoad() => _bulkLoad.Clear();
 
 	/// <summary>
 	/// Creates and opens a new database connection asynchronously.
@@ -411,11 +419,9 @@ public class Database : Disposable, IStorage
 	/// Gets the total number of entities of type <typeparamref name="TEntity"/> in the database.
 	/// </summary>
 	public virtual async ValueTask<long> GetCountAsync<TEntity>(CancellationToken cancellationToken)
+		where TEntity : IDbPersistable
 	{
 		var meta = SchemaRegistry.Get(typeof(TEntity));
-
-		if (_bulkLoad.TryGetValue(meta.EntityType, out var info))
-			return (await info.EnsureInit(cancellationToken)).Count;
 
 		var command = await GetCommand(meta, SqlCommandTypes.Count, [], [], cancellationToken);
 		var source = new SerializationItemCollection();
@@ -430,10 +436,9 @@ public class Database : Disposable, IStorage
 	/// <summary>
 	/// Creates (inserts) a new entity in the database asynchronously.
 	/// </summary>
-	public virtual ValueTask<object> CreateAsync(Schema meta, object entity, CancellationToken cancellationToken)
+	public virtual ValueTask<object> CreateAsync(Schema meta, IDbPersistable entity, CancellationToken cancellationToken)
 	{
-		if (entity.IsNull(true))
-			throw new ArgumentNullException(nameof(entity));
+		ArgumentNullException.ThrowIfNull(entity);
 
 		if (meta.ReadOnly)
 			throw new InvalidOperationException();
@@ -443,30 +448,27 @@ public class Database : Disposable, IStorage
 			var readOnlyColumns = meta.ReadOnlyColumns;
 			var nonReadOnlyColumns = meta.NonReadOnlyColumns;
 
-			var command = await GetCommand(meta, SqlCommandTypes.Create, [], meta.AllColumns, cancellationToken);
+			var keyColumns = meta.Identity is not null ? new[] { meta.Identity } : Array.Empty<SchemaColumn>();
+			var command = await GetCommand(meta, SqlCommandTypes.Create, keyColumns, meta.AllColumns, cancellationToken);
 
-			var persistable = (IDbPersistable)entity;
 			var storage = new SettingsStorage();
-			persistable.Save(storage);
+			entity.Save(storage);
 			var input = storage.ToItems(nonReadOnlyColumns);
 
 			var output = await Execute(command, input, readOnlyColumns.Count > 0, cancellationToken);
 
-			if (readOnlyColumns.Count > 0)
+			if (readOnlyColumns.Count > 0 && meta.Identity is not null)
 			{
-				foreach (var col in readOnlyColumns)
-				{
-					if (output.TryGetItem(col.Name, out var item))
-						persistable.SetIdentity(item.Value);
-				}
+				if (output.TryGetItem(meta.Identity.Name, out var identityItem))
+					entity.SetIdentity(identityItem.Value);
 			}
 
-			persistable.InitLists(this);
+			entity.InitLists(this);
 
 			if (meta.NoCache || meta.Identity is null)
-				return entity;
+				return (object)entity;
 
-			var id = persistable.GetIdentity();
+			var id = entity.GetIdentity();
 			var key = (meta.EntityType, meta.Identity.Name, id);
 
 			using (await _cacheLock.LockAsync(cancellationToken))
@@ -478,7 +480,7 @@ public class Database : Disposable, IStorage
 				dict.Add(id, entity);
 			}
 
-			return entity;
+			return (object)entity;
 		});
 	}
 
@@ -500,15 +502,21 @@ public class Database : Disposable, IStorage
 		var by = meta.Identity ?? throw new ArgumentException(meta.EntityType.AssemblyQualifiedName);
 		var key = (meta.EntityType, by.Name, id);
 
+		BulkLoadInfo bulkInfo = null;
+
 		if (!meta.NoCache)
 		{
 			if (_bulkLoad.TryGetValue(meta.EntityType, out var info))
 			{
 				if (!Scope<BulkLoadInfo>.All.Any(i => i.Value.Meta == meta))
 				{
+					bulkInfo = info;
 					var dict = await info.EnsureInit(cancellationToken);
-					var entity = dict.TryGetValue(id);
-					return entity;
+
+					if (dict.TryGetValue(id, out var cached))
+						return cached;
+
+					// cache miss — fall through to DB query below
 				}
 			}
 
@@ -547,6 +555,13 @@ public class Database : Disposable, IStorage
 			var input = UngroupSource(meta, new[] { idItem });
 
 			var entity = await Read(command, meta, input, cancellationToken);
+
+			// cache result (or null) back into bulk dict so subsequent lookups are fast
+			if (bulkInfo is not null)
+			{
+				var dict = await bulkInfo.EnsureInit(cancellationToken);
+				dict[id] = entity;
+			}
 
 			if (!meta.NoCache && entity is null)
 			{
@@ -646,11 +661,11 @@ public class Database : Disposable, IStorage
 	/// Updates an existing entity in the database asynchronously.
 	/// </summary>
 	public virtual ValueTask<TEntity> UpdateAsync<TEntity>(TEntity entity, CancellationToken cancellationToken)
+		where TEntity : IDbPersistable
 	{
-		if (entity.IsNull(true))
-			throw new ArgumentNullException(nameof(entity));
+		ArgumentNullException.ThrowIfNull(entity);
 
-		var meta = SchemaRegistry.Get(typeof(TEntity));
+		var meta = entity.Schema;
 
 		if (meta.ReadOnly)
 			throw new InvalidOperationException();
@@ -665,17 +680,16 @@ public class Database : Disposable, IStorage
 		}
 		else
 		{
-			keyColumns = meta.IndexColumns;
-			valueColumns = meta.Columns.Where(c => !c.IsReadOnly && !c.IsIndex).ToList();
+			keyColumns = meta.UniqueColumns;
+			valueColumns = meta.Columns.Where(c => !c.IsReadOnly && !c.IsUnique).ToList();
 		}
 
 		return Do(async () =>
 		{
 			var command = await GetCommand(meta, SqlCommandTypes.UpdateBy, keyColumns, valueColumns, cancellationToken);
 
-			var persistable = (IDbPersistable)entity;
 			var storage = new SettingsStorage();
-			persistable.Save(storage);
+			entity.Save(storage);
 
 			var input = new SerializationItemCollection();
 			foreach (var col in keyColumns)
@@ -683,7 +697,7 @@ public class Database : Disposable, IStorage
 				if (storage.TryGetValue(col.Name, out var v))
 					input.Add(new(col.Name, col.ClrType, v));
 				else if (col.Name == "Id")
-					input.Add(new(col.Name, col.ClrType, persistable.GetIdentity()));
+					input.Add(new(col.Name, col.ClrType, entity.GetIdentity()));
 			}
 			foreach (var col in valueColumns)
 			{
@@ -707,20 +721,20 @@ public class Database : Disposable, IStorage
 	/// Deletes an entity from the database asynchronously and returns the number of affected rows.
 	/// </summary>
 	public virtual ValueTask<int> DeleteAsync<TEntity>(TEntity entity, CancellationToken cancellationToken)
+		where TEntity : IDbPersistable
 	{
-		var meta = SchemaRegistry.Get(typeof(TEntity));
+		var meta = entity.Schema;
 
-		var persistable = (IDbPersistable)entity;
 		var by = new SerializationItemCollection();
 		IReadOnlyList<SchemaColumn> keyColumns;
 
 		if (meta.Identity is null)
 		{
 			var storage = new SettingsStorage();
-			persistable.Save(storage);
+			entity.Save(storage);
 
 			var keys = new List<SchemaColumn>();
-			foreach (var col in meta.IndexColumns)
+			foreach (var col in meta.UniqueColumns)
 			{
 				storage.TryGetValue(col.Name, out var v);
 				by.Add(new(col.Name, col.ClrType, v));
@@ -730,7 +744,7 @@ public class Database : Disposable, IStorage
 		}
 		else
 		{
-			by.Add(new(meta.Identity.Name, meta.Identity.ClrType, persistable.GetIdentity()));
+			by.Add(new(meta.Identity.Name, meta.Identity.ClrType, entity.GetIdentity()));
 			keyColumns = [meta.Identity];
 		}
 
@@ -754,6 +768,7 @@ public class Database : Disposable, IStorage
 	/// Deletes all entities of type <typeparamref name="TEntity"/> from the database.
 	/// </summary>
 	public virtual async ValueTask DeleteAllAsync<TEntity>(CancellationToken cancellationToken)
+		where TEntity : IDbPersistable
 	{
 		if (!AllowDeleteAll)
 			throw new NotSupportedException();
@@ -770,7 +785,7 @@ public class Database : Disposable, IStorage
 
 	async ValueTask IStorage.AddCacheAsync<TId, TEntity>(TId id, TEntity entity, CancellationToken cancellationToken)
 	{
-		var meta = SchemaRegistry.Get(typeof(TEntity));
+		var meta = entity.Schema;
 
 		if (meta.Identity is null || meta.NoCache)
 			return;
@@ -868,17 +883,12 @@ public class Database : Disposable, IStorage
 		return await GetOrAddCacheTableInternal(_);
 	}
 
-	private static object CreateEntity(Schema meta, object id)
+	private static IDbPersistable CreateEntity(Schema meta, object id)
 	{
-		var entity = meta.CreateEntity();
+		var entity = (IDbPersistable)meta.CreateEntity();
 
 		if (id is not null)
-		{
-			if (entity is IDbPersistable persistable)
-				persistable.SetIdentity(id);
-			else
-				meta.Load?.Invoke(entity, new([new(meta.Identity.Name, meta.Identity.ClrType, id)]));
-		}
+			entity.SetIdentity(id);
 
 		return entity;
 	}
@@ -895,19 +905,12 @@ public class Database : Disposable, IStorage
 		{
 			var noCache = CreateEntity(meta, null);
 
-			if (noCache is IDbPersistable noCachePersistable)
-			{
-				if (meta.Identity is not null)
-					noCachePersistable.SetIdentity(input[meta.Identity.Name].Value);
+			if (meta.Identity is not null)
+				noCache.SetIdentity(input[meta.Identity.Name].Value);
 
-				var storage = input.ToStorage();
-				await noCachePersistable.LoadAsync(storage, this, cancellationToken);
-				noCachePersistable.InitLists(this);
-			}
-			else
-			{
-				meta.Load?.Invoke(noCache, input);
-			}
+			var noCacheStorage = input.ToStorage();
+			await noCache.LoadAsync(noCacheStorage, this, cancellationToken);
+			noCache.InitLists(this);
 
 			return noCache;
 		}
@@ -915,7 +918,7 @@ public class Database : Disposable, IStorage
 		var id = input[meta.Identity.Name].Value;
 		var key = (meta.EntityType, meta.Identity.Name, id);
 
-		object entity = default;
+		IDbPersistable entity = default;
 
 		using (await _cacheLock.LockAsync(cancellationToken))
 		{
@@ -931,7 +934,7 @@ public class Database : Disposable, IStorage
 							return t.entity;
 						else
 						{
-							entity = t.entity;
+							entity = (IDbPersistable)t.entity;
 
 							if (entity is null)
 								throw new InvalidOperationException(key.To<string>());
@@ -941,7 +944,7 @@ public class Database : Disposable, IStorage
 					}
 					else
 					{
-						entity = t.entity;
+						entity = (IDbPersistable)t.entity;
 						scope.SetDep(key, entity);
 					}
 				}
@@ -955,15 +958,10 @@ public class Database : Disposable, IStorage
 			}
 		}
 
-		if (entity is IDbPersistable persistable2)
 		{
 			var storage = input.ToStorage();
-			await persistable2.LoadAsync(storage, this, cancellationToken);
-			persistable2.InitLists(this);
-		}
-		else
-		{
-			meta.Load?.Invoke(entity, input);
+			await entity.LoadAsync(storage, this, cancellationToken);
+			entity.InitLists(this);
 		}
 
 		return entity;
@@ -985,26 +983,25 @@ public class Database : Disposable, IStorage
 			_cache.Add(key, (entity, true));
 	}
 
-	private async ValueTask UpdateCache(Schema meta, object entity, CancellationToken cancellationToken)
+	private async ValueTask UpdateCache(Schema meta, IDbPersistable entity, CancellationToken cancellationToken)
 	{
 		var uniqueColumns = meta.UniqueColumns;
 
 		if (uniqueColumns.Count == 0)
 			return;
 
-		var persistable = (IDbPersistable)entity;
 		SettingsStorage storage = null;
 
 		var keys = uniqueColumns.Select(c =>
 		{
 			object v;
 			if (c == meta.Identity)
-				v = persistable.GetIdentity();
+				v = entity.GetIdentity();
 			else
 			{
 				storage ??= new SettingsStorage();
 				if (storage.Count == 0)
-					persistable.Save(storage);
+					entity.Save(storage);
 
 				storage.TryGetValue(c.Name, out v);
 			}
@@ -1086,7 +1083,7 @@ public class Database : Disposable, IStorage
 	#endregion
 
 	async ValueTask<TEntity> IStorage.AddAsync<TEntity>(TEntity entity, CancellationToken cancellationToken)
-		=> (TEntity)await CreateAsync(SchemaRegistry.Get(typeof(TEntity)), entity, cancellationToken);
+		=> (TEntity)await CreateAsync(entity.Schema, entity, cancellationToken);
 
 	async ValueTask<TEntity> IStorage.GetByAsync<TEntity>(IQueryable<TEntity> source, CancellationToken cancellationToken)
 	{
@@ -1114,10 +1111,141 @@ public class Database : Disposable, IStorage
 	}
 
 	async ValueTask<TEntity> IStorage.GetByIdAsync<TId, TEntity>(TId id, CancellationToken cancellationToken)
-		=> (TEntity)await ReadAsync(SchemaRegistry.Get(typeof(TEntity)), id,
+	{
+		var meta = SchemaRegistry.Get(typeof(TEntity));
+
+		if (meta.IsView)
+		{
+			var processor = ViewProcessorRegistry.GetProcessor<TEntity, TId>();
+			return await processor.ReadById(id, cancellationToken);
+		}
+
+		return (TEntity)await ReadAsync(meta, id,
 			meta => GetCommand(meta, SqlCommandTypes.ReadBy, [meta.Identity], [], cancellationToken),
 			meta => new(new SerializationItem(meta.Identity.Name, meta.Identity.ClrType, id)),
 			cancellationToken);
+	}
+
+	async ValueTask<TEntity[]> IStorage.GetByIdsAsync<TId, TEntity>(IEnumerable<TId> ids, CancellationToken cancellationToken)
+	{
+		ArgumentNullException.ThrowIfNull(ids);
+
+		var meta = SchemaRegistry.Get(typeof(TEntity));
+		var identity = meta.Identity ?? throw new ArgumentException($"Entity {meta.EntityType.Name} has no identity column.");
+
+		var allIds = ids.ToList();
+		if (allIds.Count == 0)
+			return [];
+
+		// deduplicate for DB queries, but preserve original order with duplicates for output
+		var uniqueIds = allIds.Distinct().ToList();
+		var resolved = new Dictionary<object, TEntity>();
+
+		CachedSynchronizedDictionary<object, object> bulkDict = null;
+
+		if (!meta.NoCache && _bulkLoad.TryGetValue(meta.EntityType, out var info))
+			bulkDict = await info.EnsureInit(cancellationToken);
+
+		var uncachedIds = new List<TId>();
+
+		foreach (var id in uniqueIds)
+		{
+			var found = false;
+
+			if (bulkDict is not null && bulkDict.TryGetValue(id, out var cached))
+			{
+				if (cached is TEntity entity)
+					resolved[(object)id] = entity;
+
+				// null cached = known DB miss
+				found = true;
+			}
+
+			if (!found && !meta.NoCache)
+			{
+				var key = (meta.EntityType, identity.Name, (object)id);
+
+				using (await _cacheLock.LockAsync(cancellationToken))
+				{
+					if (_cache.TryGetValue(key, out var t) && t.complete)
+					{
+						if (t.entity is TEntity entity)
+							resolved[(object)id] = entity;
+
+						found = true;
+					}
+				}
+			}
+
+			if (!found)
+				uncachedIds.Add(id);
+		}
+
+		if (uncachedIds.Count > 0)
+		{
+			// query DB in batches using IN clause
+			var chunkSize = 500.Min(Dialect.MaxParameters);
+
+			foreach (var batch in uncachedIds.Chunk(chunkSize))
+			{
+				IEnumerable<TEntity> entities;
+
+				if (meta.IsView)
+				{
+					var processor = ViewProcessorRegistry.GetProcessor<TEntity, TId>();
+					entities = await processor.ReadRange([.. batch], cancellationToken);
+				}
+				else
+				{
+					var valueColumns = new List<SchemaColumn>();
+					var input = new SerializationItemCollection();
+
+					var idx = 0;
+					foreach (var id in batch)
+					{
+						var colName = $"Id{idx++}";
+						valueColumns.Add(new() { Name = colName, ClrType = identity.ClrType });
+						input.Add(new(colName, identity.ClrType, id));
+					}
+
+					var cmd = await GetCommand(meta, SqlCommandTypes.ReadRange, [identity], valueColumns, cancellationToken);
+					entities = (await ReadAllAsync(cmd, meta, input, cancellationToken)).Cast<TEntity>();
+				}
+
+				var foundIds = new HashSet<object>();
+
+				foreach (var typedEntity in entities)
+				{
+					var entityId = ((IDbPersistable)typedEntity).GetIdentity();
+					resolved[entityId] = typedEntity;
+					foundIds.Add(entityId);
+
+					bulkDict?[entityId] = typedEntity;
+				}
+
+				// cache misses in bulk dict so subsequent lookups return null fast
+				if (bulkDict is not null)
+				{
+					foreach (var id in batch)
+					{
+						if (!foundIds.Contains(id))
+							bulkDict[(object)id] = null;
+					}
+				}
+			}
+		}
+
+		// return in input order, preserving duplicates, skipping not-found
+		var result = new List<TEntity>(allIds.Count);
+
+		foreach (var id in allIds)
+		{
+			if (resolved.TryGetValue((object)id, out var entity))
+				result.Add(entity);
+		}
+
+		return [.. result];
+	}
 
 	async ValueTask<TEntity[]> IStorage.GetGroupAsync<TEntity>(long startIndex, long count, bool deleted, string orderBy, ListSortDirection direction, CancellationToken cancellationToken)
 		=> [.. (await ReadAllAsync(SchemaRegistry.Get(typeof(TEntity)), startIndex, count, deleted, orderBy, direction, cancellationToken)).Cast<TEntity>()];
@@ -1155,30 +1283,17 @@ public class Database : Disposable, IStorage
 					var db = _parent._database;
 					var exp = _parent._expression;
 
-					if (db._bulkLoad.TryGetValue(typeof(TResult), out var info))
-					{
-						var dict = await info.EnsureInit(_cancellationToken);
+					var (translator, query, _) = GetQuery<TSource>(exp);
+					var (command, input) = db.CreateCommand(query, translator);
 
-						var source = dict.CachedValues.Cast<TResult>().AsQueryable();
+					var table = await db.ExecuteTable(command, input, _cancellationToken);
 
-						exp.ReplaceSource(source.Provider);
+					var buffer = _meta is null
+						? [.. ((IEnumerable<object>)table.First().Value).Select(e => e.To<TResult>())]
+						: await db.GetOrAddCacheTable<TResult>(_meta, table, _cancellationToken)
+					;
 
-						_underlying = new EnumerableQuery<TResult>(exp).ToAsyncEnumerable().GetAsyncEnumerator(_cancellationToken);
-					}
-					else
-					{
-						var (translator, query, _) = GetQuery<TSource>(exp);
-						var (command, input) = db.CreateCommand(query, translator);
-
-						var table = await db.ExecuteTable(command, input, _cancellationToken);
-
-						var buffer = _meta is null
-							? [.. ((IEnumerable<object>)table.First().Value).Select(e => e.To<TResult>())]
-							: await db.GetOrAddCacheTable<TResult>(_meta, table, _cancellationToken)
-						;
-
-						_underlying = buffer.ToAsyncEnumerable().GetAsyncEnumerator(_cancellationToken);
-					}
+					_underlying = buffer.ToAsyncEnumerable().GetAsyncEnumerator(_cancellationToken);
 				}
 
 				return await _underlying.MoveNextAsync();
@@ -1251,29 +1366,6 @@ public class Database : Disposable, IStorage
 	/// </summary>
 	public async ValueTask<TResult> ExecuteResultAsync<TSource, TResult>(Expression expression)
 	{
-		if (_bulkLoad.TryGetValue(typeof(TSource), out var info))
-		{
-			var mce = (MethodCallExpression)expression;
-
-			var dict = await info.EnsureInit(mce.Arguments.Count == 2 ? mce.Arguments[1].GetConstant<CancellationToken>() : default);
-
-			var queryable = dict.CachedValues.Cast<TSource>().AsQueryable();
-
-			expression.ReplaceSource(queryable.Provider);
-
-			if (mce.Method.Name == nameof(QueryableExtensions.CountAsync))
-			{
-				expression = Expression.Call(null, QueryableExtensions.GetMethodInfo<IQueryable<TSource>, int>(Queryable.Count, default), [mce.Arguments[0]]);
-			}
-			else if (mce.Method.Name == nameof(QueryableExtensions.FirstOrDefaultAsync))
-			{
-				expression = Expression.Call(null, QueryableExtensions.GetMethodInfo<IQueryable<TSource>, TSource>(Queryable.FirstOrDefault, default), [mce.Arguments[0]]);
-			}
-
-			var res = expression.Evaluate();
-			return res.To<TResult>();
-		}
-
 		var (translator, query, token) = GetQuery<TSource>(expression);
 		var (command, input) = CreateCommand(query, translator);
 
